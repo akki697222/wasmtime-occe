@@ -6,6 +6,7 @@ use crate::imms::*;
 use crate::profile::{ExecutingPc, ExecutingPcRef};
 use crate::regs::*;
 use alloc::string::ToString;
+use alloc::vec::Vec;
 use core::fmt;
 use core::mem;
 use core::ops::ControlFlow;
@@ -83,6 +84,10 @@ impl Vm {
                 DoneReason::Trap { pc, kind } => DoneReason::Trap { pc, kind },
                 DoneReason::CallIndirectHost { id, resume } => {
                     DoneReason::CallIndirectHost { id, resume }
+                }
+                DoneReason::SuspendedByHook { resume } => {
+                    self.state.lr = lr;
+                    DoneReason::SuspendedByHook { resume }
                 }
             }
         }
@@ -212,6 +217,38 @@ impl Vm {
     /// Sets the current `lr` register value.
     pub unsafe fn set_lr(&mut self, lr: *mut u8) {
         self.state.lr = lr;
+    }
+
+    /// A: レジスタファイルとスタックをダンプする。
+    ///
+    /// # Safety
+    /// スタックポインタが有効な範囲を指していること。
+    pub unsafe fn capture_regs(&self) -> RegSnapshot {
+        unsafe { self.state.capture_regs() }
+    }
+
+    /// A: RegSnapshotからレジスタファイルとスタックを復元する。
+    ///
+    /// # Safety
+    /// snapはこのVmと同じスタックサイズで取得したものであること。
+    pub unsafe fn restore_regs(&mut self, snap: &RegSnapshot) {
+        unsafe { self.state.restore_regs(snap) }
+    }
+
+    /// B: 次のcall_run開始時にpcをtargetに差し替えるよう要求する。
+    pub fn set_pc(&mut self, target: core::ptr::NonNull<u8>) {
+        self.state.set_pc(target);
+    }
+
+    /// D: ディスパッチフックをセットする。
+    /// intervalは何命令ごとにフックを呼ぶかの設定。
+    pub fn set_hook(&mut self, hook: fn(&mut MachineState) -> OcHookAction, interval: u32) {
+        self.state.set_hook(hook, interval);
+    }
+
+    /// D: フックを解除する。
+    pub fn clear_hook(&mut self) {
+        self.state.clear_hook();
     }
 
     /// Gets a handle to the currently executing program counter for this
@@ -745,6 +782,15 @@ pub struct MachineState {
     lr: *mut u8,
     stack: Stack,
     done_reason: Option<DoneReason<()>>,
+
+    // ── OC Fork: 実行コンテキスト保存 / フック用フィールド ──────────────
+    /// OC Fork: ディスパッチフック
+    pub oc_hook: Option<fn(&mut MachineState) -> OcHookAction>,
+    /// OC Fork: フック呼び出し間隔
+    pub oc_hook_interval: u32,
+    pub(crate) oc_hook_countdown: u32,
+    /// OC Fork: ジャンプ先PC
+    pub oc_jump_target: Option<core::ptr::NonNull<u8>>,
 }
 
 unsafe impl Send for MachineState {}
@@ -817,6 +863,7 @@ impl fmt::Debug for MachineState {
             done_reason: _,
             fp: _,
             lr: _,
+            ..
         } = self;
 
         struct RegMap<'a, R>(&'a [R], fn(u8) -> alloc::string::String);
@@ -901,6 +948,10 @@ impl MachineState {
             done_reason: None,
             fp: HOST_RETURN_ADDR,
             lr: HOST_RETURN_ADDR,
+            oc_hook: None,
+            oc_hook_interval: 1000,
+            oc_hook_countdown: 1000,
+            oc_jump_target: None,
         };
 
         let sp = state.stack.top();
@@ -925,6 +976,12 @@ mod done {
         _priv: (),
     }
 
+    impl Done {
+        pub(super) fn new() -> Self {
+            Done { _priv: () }
+        }
+    }
+
     /// Reason that the pulley interpreter has ceased execution.
     pub enum DoneReason<T> {
         /// A trap happened at this bytecode instruction.
@@ -943,6 +1000,12 @@ mod done {
         },
         /// Pulley has finished and the provided value is being returned.
         ReturnToHost(T),
+
+        /// OC Fork: SuspendedByHook
+        SuspendedByHook {
+            /// Where to resume execution.
+            resume: NonNull<u8>,
+        },
     }
 
     /// Stored within `DoneReason::Trap`.
@@ -1008,6 +1071,125 @@ mod done {
 
 use done::Done;
 pub use done::{DoneReason, TrapKind};
+
+// ── OC Fork: 公開型 / MachineState OC API ─────────────────────────────────
+
+/// OC Fork: フックのアクション
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OcHookAction {
+    /// 継続
+    Continue,
+    /// 中断
+    Suspend,
+}
+
+/// OC Fork: レジスタファイルとスタックのダンプ
+#[derive(Clone, Debug)]
+pub struct RegSnapshot {
+    /// x0〜x15の生u64
+    pub x_regs: Vec<u64>,
+    /// f0〜f15のf64ビット列
+    pub f_regs: Vec<u64>,
+    /// fpのスタックベースからのオフセット
+    pub fp_offset: isize,
+    /// lrのスタックベースからのオフセット
+    pub lr_offset: isize,
+    /// sp〜topのバイト数
+    pub stack_used_bytes: usize,
+    /// スタック使用済み領域の内容
+    pub stack_data: Vec<u8>,
+}
+
+impl MachineState {
+    /// A: レジスタファイルとスタックをダンプする。
+    pub unsafe fn capture_regs(&self) -> RegSnapshot {
+        let stack_base = self.stack.storage.as_ptr() as *const u8;
+        let stack_top = unsafe { self.stack.storage.as_ptr().add(self.stack.storage.capacity()) } as *const u8;
+        let sp = self[XReg::sp].get_ptr::<u8>();
+
+        let fp_offset = if self.fp == HOST_RETURN_ADDR {
+            isize::MAX
+        } else {
+            (self.fp as usize).wrapping_sub(stack_base as usize) as isize
+        };
+
+        let lr_offset = if self.lr == HOST_RETURN_ADDR {
+            isize::MAX
+        } else {
+            (self.lr as usize).wrapping_sub(stack_base as usize) as isize
+        };
+
+        let stack_used_bytes = (stack_top as usize).wrapping_sub(sp as usize);
+        let stack_data = if stack_used_bytes > 0 {
+            unsafe { core::slice::from_raw_parts(sp, stack_used_bytes).to_vec() }
+        } else {
+            Vec::new()
+        };
+
+        RegSnapshot {
+            x_regs: self.x_regs.iter().map(|r| r.get_u64()).collect(),
+            f_regs: self.f_regs.iter().map(|r| r.get_f64().to_bits()).collect(),
+            fp_offset,
+            lr_offset,
+            stack_used_bytes,
+            stack_data,
+        }
+    }
+
+    /// A: RegSnapshotからレジスタファイルとスタックを復元する。
+    pub unsafe fn restore_regs(&mut self, snap: &RegSnapshot) {
+        let stack_base = self.stack.storage.as_ptr() as *mut u8;
+        let stack_top = unsafe { stack_base.add(self.stack.storage.capacity() * mem::size_of::<Align16>()) };
+
+        for (i, &val) in snap.x_regs.iter().enumerate() {
+            self.x_regs[i].set_u64(val);
+        }
+        for (i, &val) in snap.f_regs.iter().enumerate() {
+            self.f_regs[i].set_f64(f64::from_bits(val));
+        }
+
+        self.fp = if snap.fp_offset == isize::MAX {
+            HOST_RETURN_ADDR
+        } else {
+            stack_base.wrapping_offset(snap.fp_offset)
+        };
+
+        self.lr = if snap.lr_offset == isize::MAX {
+            HOST_RETURN_ADDR
+        } else {
+            stack_base.wrapping_offset(snap.lr_offset)
+        };
+
+        let sp = stack_top.wrapping_sub(snap.stack_used_bytes);
+        if !snap.stack_data.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    snap.stack_data.as_ptr(),
+                    sp,
+                    snap.stack_used_bytes,
+                );
+            }
+        }
+        self[XReg::sp].set_ptr(sp);
+    }
+
+    /// B: 次のcall_run開始時にpcをtargetに差し替えるよう要求する。
+    pub fn set_pc(&mut self, target: core::ptr::NonNull<u8>) {
+        self.oc_jump_target = Some(target);
+    }
+
+    /// D: ディスパッチフックをセットする。
+    pub fn set_hook(&mut self, hook: fn(&mut MachineState) -> OcHookAction, interval: u32) {
+        self.oc_hook = Some(hook);
+        self.oc_hook_interval = interval;
+        self.oc_hook_countdown = interval;
+    }
+
+    /// D: フックを解除する。
+    pub fn clear_hook(&mut self) {
+        self.oc_hook = None;
+    }
+}
 
 struct Interpreter<'a> {
     state: &'a mut MachineState,
