@@ -612,8 +612,10 @@ impl Executor {
 }
 
 /// A borrowed reference to `Executor` above.
-pub(crate) enum ExecutorRef<'a> {
+pub enum ExecutorRef<'a> {
+    /// Pulley interpreter is used.
     Interpreter(InterpreterRef<'a>),
+    /// Native code is used.
     #[cfg(has_host_compiler_backend)]
     Native,
 }
@@ -1187,6 +1189,11 @@ impl<T> Store<T> {
     /// [`StoreContextMut::throw`].
     pub fn has_pending_exception(&self) -> bool {
         self.inner.has_pending_exception()
+    }
+
+    /// Returns the executor for this store.
+    pub fn executor(&mut self) -> ExecutorRef<'_> {
+        self.inner.inner.executor()
     }
 
     /// Return all breakpoints.
@@ -2232,7 +2239,7 @@ at https://bytecodealliance.org/security.
         self.pkey.is_some()
     }
 
-    pub(crate) fn executor(&mut self) -> ExecutorRef<'_> {
+    pub fn executor(&mut self) -> ExecutorRef<'_> {
         match &mut self.executor {
             Executor::Interpreter(i) => ExecutorRef::Interpreter(i.as_interpreter_ref()),
             #[cfg(has_host_compiler_backend)]

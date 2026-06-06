@@ -128,6 +128,15 @@ unsafe impl Unwind for UnwindPulley {
 }
 
 impl InterpreterRef<'_> {
+    pub fn vm(&mut self) -> &mut Vm {
+        &mut self.vm_state().vm
+    }
+
+    pub fn pulley(&self) -> &Vm {
+        let state = unsafe { self.vm.as_ref() };
+        &state.vm
+    }
+
     fn vm_state(&mut self) -> &mut VmState {
         // SAFETY: This is a bit of a tricky code. The safety here is isolated
         // to this file, but not isolated to just this function call.
@@ -156,9 +165,6 @@ impl InterpreterRef<'_> {
         unsafe { self.vm.as_mut() }
     }
 
-    fn vm(&mut self) -> &mut Vm {
-        &mut self.vm_state().vm
-    }
 
     /// Invokes interpreted code.
     ///
@@ -226,6 +232,17 @@ impl InterpreterRef<'_> {
                 DoneReason::Trap { pc, kind } => {
                     bytecode = self.trap(pc, kind);
                     vm = self.vm();
+                }
+
+                DoneReason::SuspendedByHook { resume } => {
+                    unsafe {
+                        self.vm().set_lr(old_lr);
+                    }
+                    // For now, return true so the host thinks it completed,
+                    // but since this is mid-execution, we'll use other state
+                    // to determine it suspended.
+                    let _ = resume;
+                    break true;
                 }
             }
         };

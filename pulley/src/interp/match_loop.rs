@@ -18,10 +18,15 @@
 use super::*;
 
 impl Interpreter<'_> {
-    pub fn run(self) -> Done {
+    pub fn run(mut self) -> Done {
         let mut decoder = Decoder::new();
         let mut visitor = debug::Debug(self);
         loop {
+            // OC Fork B: 任意PCジャンプ
+            if let Some(target) = visitor.0.state.oc_jump_target.take() {
+                visitor.0.pc = unsafe { UnsafeBytecodeStream::new(target) };
+            }
+
             // Here `decode_one` will call the appropriate `OpVisitor` method on
             // `self` via the trait implementation in the module above this.
             // That'll return whether we should keep going or exit the loop,
@@ -32,6 +37,23 @@ impl Interpreter<'_> {
             match decoder.decode_one(&mut visitor) {
                 Ok(ControlFlow::Continue(())) => {}
                 Ok(ControlFlow::Break(done)) => break done,
+            }
+
+            // OC Fork D: ディスパッチフック
+            if visitor.0.state.oc_hook.is_some() {
+                let countdown = &mut visitor.0.state.oc_hook_countdown;
+                if *countdown == 0 {
+                    *countdown = visitor.0.state.oc_hook_interval;
+                    let hook = visitor.0.state.oc_hook.unwrap();
+                    if hook(visitor.0.state) == OcHookAction::Suspend {
+                        let resume = visitor.0.pc.as_ptr();
+                        visitor.0.state.done_reason =
+                            Some(DoneReason::SuspendedByHook { resume });
+                        break Done::new();
+                    }
+                } else {
+                    visitor.0.state.oc_hook_countdown -= 1;
+                }
             }
         }
     }
